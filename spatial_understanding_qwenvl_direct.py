@@ -15,13 +15,14 @@ import base64
 import xml.etree.ElementTree as ET
 from openai import OpenAI
 import torch
+from qwen_vl_utils import smart_resize
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 # Get additional colors for visualization
 additional_colors = [colorname for (colorname, colorcode) in ImageColor.colormap.items()]
 
-def decode_xml_points(text):
+def decode_xml_points(text): 
     """Decode XML formatted point coordinates."""
     try:
         root = ET.fromstring(text)
@@ -167,22 +168,41 @@ def plot_points(im, text, input_width, input_height):
   
     img.show()
 
-def encode_image(image_path):
-    """Encode image to base64 format."""
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode("utf-8")
+def encode_image(image_input):
+    """Encode image to base64 format.
+    
+    Args:
+        image_input: Either a file path (str) or PIL Image object
+        
+    Returns:
+        str: Base64 encoded image string
+    """
+    if isinstance(image_input, str):
+        # Handle file path
+        with open(image_input, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode("utf-8")
+    elif hasattr(image_input, 'save'):
+        # Handle PIL Image object
+        buffer = io.BytesIO()
+        # Determine format based on original format or default to JPEG
+        format = getattr(image_input, 'format', 'PNG') or 'PNG'
+        image_input.save(buffer, format=format)
+        buffer.seek(0)
+        return base64.b64encode(buffer.read()).decode("utf-8")
+    else:
+        raise TypeError("image_input must be either a file path string or PIL Image object")
 
 class QwenVLSpatialUnderstanding:
     """Main class for Qwen2.5-VL spatial understanding capabilities."""
     
     def __init__(self, model_path="Qwen/Qwen2.5-VL-7B-Instruct", device="auto"):
         """Initialize the model and processor."""
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_path, 
-            torch_dtype=torch.bfloat16, 
-            attn_implementation="flash_attention_2",
-            device_map=device
-        )
+        # self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        #     model_path, 
+        #     torch_dtype=torch.bfloat16, 
+        #     attn_implementation="flash_attention_2",
+        #     device_map=device
+        # )
         self.processor = AutoProcessor.from_pretrained(model_path)
     
     def inference(self, img_url, prompt, system_prompt="You are a helpful assistant", max_new_tokens=1024):
@@ -224,12 +244,12 @@ class QwenVLSpatialUnderstanding:
         return output_text[0], input_height, input_width
 
     def inference_with_api(self, image_path, prompt, sys_prompt="You are a helpful assistant.", 
-                          model_id="qwen2.5-vl-72b-instruct", min_pixels=512*28*28, max_pixels=2048*28*28):
+                          model_id="Qwen/Qwen2.5-VL-72B-Instruct", min_pixels=512*28*28, max_pixels=2048*28*28):
         """Run inference using API approach."""
         base64_image = encode_image(image_path)
         client = OpenAI(
-            api_key=os.getenv('DASHSCOPE_API_KEY'),
-            base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            api_key='ms-b54b6a76-6448-43cf-95b0-1989bff2734e',
+            base_url="https://api-inference.modelscope.cn/v1/",
         )
 
         messages = [
@@ -254,6 +274,8 @@ class QwenVLSpatialUnderstanding:
         completion = client.chat.completions.create(
             model=model_id,
             messages=messages,
+            seed=42,
+            temperature=0.0,
         )
         
         return completion.choices[0].message.content
@@ -354,47 +376,211 @@ def demo_custom_system_prompt():
     
     response, input_height, input_width = qwen_vl.inference(image_path, prompt, system_prompt=system_prompt)
 
-def extract_objects_from_instruction(instruction, api_key=None, model_id="qwen2.5-vl-72b-instruct"):
+# API-based demo functions
+def demo_detect_objects_api():
+    """Demo: Detect certain objects in the image using API."""
+    qwen_vl = QwenVLSpatialUnderstanding()
+    image_path = "/Users/ljq/Desktop/Tongyi-Intern/Uni/eval/gen/ml-gie-bench/images2000/accessories/pexels-anastasiya-gepp-654466-2036646.jpg"
+    min_pixels = 512*28*28
+    max_pixels = 1280*28*28
+    
+    # Calculate input dimensions using smart_resize
+    image = Image.open(image_path)
+    width, height = image.size
+    input_height, input_width = smart_resize(height, width, min_pixels=min_pixels, max_pixels=max_pixels)
+
+    image_resized = image.resize((input_width, input_height), Image.BICUBIC)
+    
+    prompt = "Outline the position of the woman's head and output the coordinates in JSON format."
+    response = qwen_vl.inference_with_api(image_resized, prompt, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    # image.thumbnail([640, 640], Image.LANCZOS)
+    plot_bounding_boxes(image, response, input_width, input_height)
+
+def demo_detect_specific_object_api():
+    """Demo: Detect a specific object using descriptions with API."""
+    qwen_vl = QwenVLSpatialUnderstanding()
+    image_path = "./assets/spatial_understanding/cakes.png"
+    min_pixels = 512*28*28
+    max_pixels = 1280*28*28
+    
+    image = Image.open(image_path)
+    width, height = image.size
+    input_height, input_width = smart_resize(height, width, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    prompt = "Locate the top right brown cake, output its bbox coordinates using JSON format."
+    response = qwen_vl.inference_with_api(image_path, prompt, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    image.thumbnail([640, 640], Image.Resampling.LANCZOS)
+    plot_bounding_boxes(image, response, input_width, input_height)
+
+def demo_point_detection_api():
+    """Demo: Point to certain objects in XML format using API."""
+    qwen_vl = QwenVLSpatialUnderstanding()
+    image_path = "./assets/spatial_understanding/cakes.png"
+    min_pixels = 512*28*28
+    max_pixels = 2048*28*28
+    
+    image = Image.open(image_path)
+    width, height = image.size
+    input_height, input_width = smart_resize(height, width, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    prompt = "point to the rolling pin on the far side of the table, output its coordinates in XML format <points x y>object</points>"
+    response = qwen_vl.inference_with_api(image_path, prompt, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    image.thumbnail([640, 640], Image.Resampling.LANCZOS)
+    plot_points(image, response, input_width, input_height)
+
+def demo_reasoning_capability_api():
+    """Demo: Reasoning capability - finding shadow of paper fox using API."""
+    qwen_vl = QwenVLSpatialUnderstanding()
+    image_path = "./assets/spatial_understanding/Origamis.jpg"
+    min_pixels = 512*28*28
+    max_pixels = 2048*28*28
+    
+    image = Image.open(image_path)
+    width, height = image.size
+    input_height, input_width = smart_resize(height, width, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    prompt = "Locate the shadow of the paper fox, report the bbox coordinates in JSON format."
+    response = qwen_vl.inference_with_api(image_path, prompt, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    image.thumbnail([640, 640], Image.Resampling.LANCZOS)
+    plot_bounding_boxes(image, response, input_width, input_height)
+
+def demo_relationship_understanding_api():
+    """Demo: Understand relationships across different instances using API."""
+    qwen_vl = QwenVLSpatialUnderstanding()
+    image_path = "./assets/spatial_understanding/cartoon_brave_person.jpeg"
+    min_pixels = 512*28*28
+    max_pixels = 2048*28*28
+    
+    image = Image.open(image_path)
+    width, height = image.size
+    input_height, input_width = smart_resize(height, width, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    prompt = "Locate the person who act bravely, report the bbox coordinates in JSON format."
+    response = qwen_vl.inference_with_api(image_path, prompt, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    image.thumbnail([640, 640], Image.Resampling.LANCZOS)
+    plot_bounding_boxes(image, response, input_width, input_height)
+
+def demo_special_instance_api():
+    """Demo: Find a special instance with unique characteristic using API."""
+    qwen_vl = QwenVLSpatialUnderstanding()
+    image_path = "./assets/spatial_understanding/multiple_items.png"
+    min_pixels = 512*28*28
+    max_pixels = 2048*28*28
+    
+    image = Image.open(image_path)
+    width, height = image.size
+    input_height, input_width = smart_resize(height, width, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    prompt = "If the sun is very glaring, which item in this image should I use? Please locate it in the image with its bbox coordinates and its name and output in JSON format."
+    response = qwen_vl.inference_with_api(image_path, prompt, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    image.thumbnail([640, 640], Image.Resampling.LANCZOS)
+    plot_bounding_boxes(image, response, input_width, input_height)
+
+def demo_counting_with_grounding_api():
+    """Demo: Use Qwen2.5-VL grounding capabilities to help counting using API."""
+    qwen_vl = QwenVLSpatialUnderstanding()
+    image_path = "./assets/spatial_understanding/multiple_items.png"
+    min_pixels = 512*28*28
+    max_pixels = 2048*28*28
+    
+    image = Image.open(image_path)
+    width, height = image.size
+    input_height, input_width = smart_resize(height, width, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    prompt = "Please first output bbox coordinates and names of every item in this image in JSON format, and then answer how many items are there in the image."
+    response = qwen_vl.inference_with_api(image_path, prompt, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    image.thumbnail([640, 640], Image.Resampling.LANCZOS)
+    plot_bounding_boxes(image, response, input_width, input_height)
+
+def demo_custom_system_prompt_api():
+    """Demo: Spatial understanding with designed system prompt for plain text output using API."""
+    qwen_vl = QwenVLSpatialUnderstanding()
+    image_path = "./assets/spatial_understanding/cakes.png"
+    min_pixels = 512*28*28
+    max_pixels = 2048*28*28
+    
+    image = Image.open(image_path)
+    width, height = image.size
+    input_height, input_width = smart_resize(height, width, min_pixels=min_pixels, max_pixels=max_pixels)
+    
+    system_prompt = "As an AI assistant, you specialize in accurate image object detection, delivering coordinates in plain text format 'x1,y1,x2,y2 object'."
+    prompt = "find all cakes"
+    
+    response = qwen_vl.inference_with_api(image_path, prompt, sys_prompt=system_prompt, min_pixels=min_pixels, max_pixels=max_pixels)
+    print("API Response:", response)
+
+def run_spatial_demo(use_api=False, demo_name="detect_objects"):
     """
-    Extract and describe objects that need to be edited from an image editing instruction.
+    Utility function to run spatial understanding demos.
     
     Args:
-        instruction (str): The image editing instruction
-        api_key (str): API key for the service (uses DASHSCOPE_API_KEY env var if not provided)
-        model_id (str): Model ID to use for extraction
-        
-    Returns:
-        str: Description of objects to be edited
+        use_api (bool): Whether to use API or local model
+        demo_name (str): Name of demo to run
     """
-    if api_key is None:
-        api_key = os.getenv('DASHSCOPE_API_KEY')
+    demos_local = {
+        "detect_objects": demo_detect_objects,
+        "detect_specific": demo_detect_specific_object,
+        "point_detection": demo_point_detection,
+        "reasoning": demo_reasoning_capability,
+        "relationship": demo_relationship_understanding,
+        "special_instance": demo_special_instance,
+        "counting": demo_counting_with_grounding,
+        "custom_prompt": demo_custom_system_prompt
+    }
     
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-    )
+    demos_api = {
+        "detect_objects": demo_detect_objects_api,
+        "detect_specific": demo_detect_specific_object_api,
+        "point_detection": demo_point_detection_api,
+        "reasoning": demo_reasoning_capability_api,
+        "relationship": demo_relationship_understanding_api,
+        "special_instance": demo_special_instance_api,
+        "counting": demo_counting_with_grounding_api,
+        "custom_prompt": demo_custom_system_prompt_api
+    }
     
-    prompt = f"""Given this image editing instruction: {instruction}. Please extract and describe the object or objects that need to be edited in the original image. Do not include objects to appear in the edited image. For example, 'red apple', or 'giraffe'. If the change is applied to the entire image like a lighting change, then say 'entire image'. Be concise."""
-    
-    messages = [
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": prompt}]
-        }
-    ]
-    
-    completion = client.chat.completions.create(
-        model=model_id,
-        messages=messages,
-    )
-    
-    return completion.choices[0].message.content.strip()
+    if use_api:
+        print(f"Running {demo_name} demo with API...")
+        demos_api[demo_name]()
+    else:
+        print(f"Running {demo_name} demo with local model...")
+        demos_local[demo_name]()
 
 if __name__ == "__main__":
     # Example usage
     print("Qwen2.5-VL Spatial Understanding Demo")
     print("=====================================")
     
-    demo_counting_with_grounding()
+    # Test local inference
+    print("\n--- Local Model Demo ---")
+    run_spatial_demo(use_api=True, demo_name="detect_objects")
     
-    print("Demo completed!")
+    print("\n--- API Demo Usage Examples ---")
+    print("To use API demos, set DASHSCOPE_API_KEY environment variable:")
+    print("os.environ['DASHSCOPE_API_KEY'] = 'your_api_key_here'")
+    print()
+    print("Then you can use the utility function:")
+    print("# Run API demo")
+    print("run_spatial_demo(use_api=True, demo_name='counting')")
+    print()
+    print("# Run local demo")
+    print("run_spatial_demo(use_api=False, demo_name='counting')")
+    print()
+    print("Available demo names:")
+    print("- detect_objects")
+    print("- detect_specific") 
+    print("- point_detection")
+    print("- reasoning")
+    print("- relationship")
+    print("- special_instance")
+    print("- counting")
+    print("- custom_prompt")
+    
+    print("\nDemo completed!")
