@@ -8,6 +8,41 @@ import base64
 import requests
 import json
 from io import BytesIO
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import wraps
+
+def retry_on_failure(max_retries=3, delay=1.0, backoff=2.0):
+    """
+    Retry decorator with exponential backoff.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        delay: Initial delay between retries in seconds
+        backoff: Multiplicative factor for delay
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            retry_delay = delay
+            last_exception = None
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        print(f"Attempt {attempt + 1} failed for {func.__name__}: {e}. Retrying in {retry_delay:.1f}s...")
+                        time.sleep(retry_delay)
+                        retry_delay *= backoff
+                    else:
+                        print(f"All {max_retries + 1} attempts failed for {func.__name__}")
+            
+            raise last_exception
+        return wrapper
+    return decorator
+
 
 PREFERRED_KONTEXT_RESOLUTIONS = [
     (672, 1568),
@@ -414,44 +449,131 @@ Put the score in a list such that output score = [naturalness, artifacts]"""
         }
 
 
-def compute_image_metrics(original_path, edited_path, object_mask=None, vie_instruction=None, api_key=None):
+@retry_on_failure(max_retries=3, delay=1.0, backoff=2.0)
+def process_single_image_metrics(args):
     """
-    Compute all image metrics (SSIM, PSNR, MSE, VIEScore) for a pair of images.
+    Process metrics for a single image pair with retry mechanism.
     
     Args:
-        original_path: Path to the original image
-        edited_path: Path to the edited image
-        object_mask: Optional mask array to exclude certain areas
-        vie_instruction: Optional editing instruction for VIEScore evaluation
-        api_key: Optional OpenAI API key for VIEScore evaluation
+        args: Tuple containing (i, ref_img, edited_img, mask_img, prompt, api_key, image_processor)
+    
+    Returns:
+        Dictionary containing computed metrics for the image pair
+    """
+    i, ref_img, edited_img, mask_img, prompt, api_key, image_processor = args
+    
+    import tempfile
+    
+    try:
+        # Process images to kontext-compatible size using the unified function
+        ref_resized = image_processor_flux_context(image_processor, ref_img, _auto_resize=True, if_mask=False)
+        edited_resized = image_processor_flux_context(image_processor, edited_img, _auto_resize=True, if_mask=False)
+        mask_resized = image_processor_flux_context(image_processor, mask_img, _auto_resize=True, if_mask=True)
+        
+        # Assert all images have the same size
+        assert ref_resized.size == edited_resized.size == mask_resized.size, \
+            f"Image sizes don't match: ref={ref_resized.size}, edited={edited_resized.size}, mask={mask_resized.size}"
+        
+        # Create temporary files for metric calculations
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as ref_tmp, \
+             tempfile.NamedTemporaryFile(suffix='.png', delete=False) as edited_tmp:
+            
+            ref_resized.save(ref_tmp.name)
+            edited_resized.save(edited_tmp.name)
+            
+            # Convert mask to numpy array for metric calculations
+            mask_array = np.array(mask_resized)
+            if len(mask_array.shape) == 3:
+                mask_array = mask_array[:, :, 0]  # Convert to grayscale if needed
+            
+            # Calculate metrics
+            metrics = {
+                'image_index': i,
+                'target_size': ref_resized.size,
+                'mse': ImageMetrics.calculate_mse(ref_tmp.name, edited_tmp.name, mask_array),
+                'psnr': ImageMetrics.calculate_psnr(ref_tmp.name, edited_tmp.name, mask_array),
+                'ssim': ImageMetrics.calculate_ssim(ref_tmp.name, edited_tmp.name, mask_array),
+            }
+            
+            # Add VIEScore evaluation
+            if api_key and prompt:
+                try:
+                    vie_scorer = VIEScore(api_key=api_key)
+                    vie_tie_results = vie_scorer.evaluate_tie(ref_tmp.name, edited_tmp.name, prompt)
+                    vie_pq_results = vie_scorer.evaluate_pq(edited_tmp.name)
+                    if vie_tie_results:
+                        metrics.update(vie_tie_results)
+                    if vie_pq_results:
+                        metrics.update(vie_pq_results)
+                except Exception as e:
+                    print(f"VIEScore evaluation failed for image {i}: {e}")
+                    metrics['vie_error'] = str(e)
+            
+            # Clean up temporary files
+            os.unlink(ref_tmp.name)
+            os.unlink(edited_tmp.name)
+            
+            return metrics
+            
+    except Exception as e:
+        print(f"Error processing image {i}: {e}")
+        return {
+            'image_index': i,
+            'error': str(e)
+        }
+
+
+def compute_image_metrics_pil_batch(ref_images, edited_images, mask_images, prompts, api_key, max_workers=4):
+    """
+    Compute all image metrics (SSIM, PSNR, MSE, VIEScore) for batches of PIL images using multithreading.
+    
+    Args:
+        ref_images: List of PIL.Image objects (reference images)
+        edited_images: List of PIL.Image objects (edited images)  
+        mask_images: List of PIL.Image objects (mask images)
+        prompts: List of str (editing instructions)
+        api_key: str (OpenAI API key for VIEScore evaluation)
+        max_workers: int (maximum number of worker threads, default=4)
         
     Returns:
-        Dictionary containing all computed metrics
+        List of dictionaries containing computed metrics for each image pair
     """
-    if not os.path.exists(original_path) or not os.path.exists(edited_path):
-        return None
+    from diffusers.image_processor import VaeImageProcessor
+    
+    # Initialize image processor
+    image_processor = VaeImageProcessor(vae_scale_factor=8)
+    
+    # Prepare arguments for each worker
+    worker_args = [
+        (i, ref_img, edited_img, mask_img, prompt, api_key, image_processor)
+        for i, (ref_img, edited_img, mask_img, prompt) in enumerate(zip(ref_images, edited_images, mask_images, prompts))
+    ]
+    
+    results = [None] * len(worker_args)  # Pre-allocate results list to maintain order
+    
+    # Process images in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_index = {
+            executor.submit(process_single_image_metrics, args): args[0] 
+            for args in worker_args
+        }
         
-    metrics = {
-        'mse': ImageMetrics.calculate_mse(original_path, edited_path, object_mask),
-        'psnr': ImageMetrics.calculate_psnr(original_path, edited_path, object_mask), 
-        'ssim': ImageMetrics.calculate_ssim(original_path, edited_path, object_mask),
-    }
+        # Collect results as they complete
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            try:
+                result = future.result()
+                results[index] = result
+                print(f"Completed processing image {index}")
+            except Exception as e:
+                print(f"Failed to process image {index}: {e}")
+                results[index] = {
+                    'image_index': index,
+                    'error': str(e)
+                }
     
-    # Add VIEScore evaluation if instruction is provided
-    if vie_instruction and (api_key or os.environ.get('OPENAI_API_KEY')):
-        try:
-            vie_scorer = VIEScore(api_key=api_key)
-            vie_tie_results = vie_scorer.evaluate_tie(original_path, edited_path, vie_instruction)
-            vie_pq_results = vie_scorer.evaluate_pq(edited_path)
-            if vie_tie_results:
-                metrics.update(vie_tie_results)
-            if vie_pq_results:
-                metrics.update(vie_pq_results)
-        except Exception as e:
-            print(f"VIEScore evaluation failed: {e}")
-            metrics['vie_error'] = str(e)
-    
-    return metrics
+    return results
 
 
 def compute_single_image_quality(image_path, api_key=None):
@@ -476,18 +598,38 @@ def compute_single_image_quality(image_path, api_key=None):
         print(f"Single image quality evaluation failed: {e}")
         return {'vie_error': str(e)}
 
-def image_processor_flux_context(image_processor, image_path, _auto_resize=True, if_mask=False):
+def image_processor_flux_context(image_processor, image_input, _auto_resize=True, if_mask=False):
     """
     Get the context of the image processor for Flux.
+    
+    Args:
+        image_processor: VaeImageProcessor instance
+        image_input: str (image path) or PIL.Image object
+        _auto_resize: bool, whether to auto resize to kontext resolutions
+        if_mask: bool, whether this is a mask image
+    
+    Returns:
+        PIL.Image: Processed image
     """
 
     multiple_of = image_processor.vae_scale_factor * 2
 
-    if image_path is not None:
-        if if_mask:
-            image = Image.open(image_path).convert("L")
+    # Handle both path string and PIL.Image input
+    if image_input is not None:
+        if isinstance(image_input, str):
+            # Input is a file path
+            if if_mask:
+                image = Image.open(image_input).convert("L")
+            else:
+                image = Image.open(image_input).convert("RGB")
         else:
-            image = Image.open(image_path).convert("RGB")
+            # Input is already a PIL.Image
+            if if_mask:
+                image = image_input.convert("L")
+            else:
+                image = image_input.convert("RGB")
+    else:
+        raise ValueError("image_input cannot be None")
 
     image_height, image_width = image_processor.get_default_height_width(image)
     aspect_ratio = image_width / image_height
@@ -508,28 +650,114 @@ def image_processor_flux_context(image_processor, image_path, _auto_resize=True,
 
 if __name__ == "__main__":
     from diffusers.image_processor import VaeImageProcessor
-    image_processor = VaeImageProcessor(vae_scale_factor=8)
+    
+    # Initialize
     api_key = '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'
-
-    original_path = "/Users/ljq/Downloads/020.png"
-    edited_path = "/Users/ljq/Downloads/generation-85c8e002-5378-4dc9-9ee8-d4e3dd8a2db1.png"
-    edited_ovis_path = "/Users/ljq/Downloads/image_ovis.webp"
+    
+    # Test file paths
+    original_path = "/Users/ljq/Downloads/new.jpg"
+    edited_path = "/Users/ljq/Downloads/1755608073.png"
+    edited_ovis_path = "/Users/ljq/Downloads/1755608073.png"
     mask_path = "/Users/ljq/Downloads/020_mask.jpg"
-
-    original_image = image_processor_flux_context(image_processor, original_path, if_mask=False)
-    mask_image = image_processor_flux_context(image_processor, mask_path, if_mask=True).resize((original_image.size[0], original_image.size[1]), resample=Image.BICUBIC)
-
-    print(original_image.size)
-    print(mask_image.size)
-
-    mask_image = np.asarray(mask_image, dtype=np.int64) / 255
-    mask_image = mask_image[:, :, np.newaxis].repeat([3], axis=2)
-
-    result = compute_image_metrics(original_path, edited_path, mask_image, vie_instruction="Change the middle bird to a chicken", api_key=api_key)
-    result_ovis = compute_image_metrics(original_path, edited_ovis_path, mask_image, vie_instruction="Change the middle bird to a chicken", api_key=api_key)
-
-    print(result)
-    print(result_ovis)
+    
+    print("=== Testing New Batch Processing Function ===")
+    
+    try:
+        # Load PIL images for batch processing
+        ref_images = [
+            Image.open(original_path),
+            Image.open(original_path)  # Using same image twice for demo
+        ]
+        
+        edited_images = [
+            Image.open(edited_path),
+            Image.open(edited_ovis_path)
+        ]
+        
+        mask_images = [
+            Image.open(mask_path),
+            Image.open(mask_path)  # Using same mask twice for demo
+        ]
+        
+        prompts = [
+            "Change the middle bird to a chicken",
+            "Change the middle bird to a chicken"
+        ]
+        
+        print(f"Processing {len(ref_images)} image pairs...")
+        print(f"Original image sizes: {[img.size for img in ref_images]}")
+        print(f"Edited image sizes: {[img.size for img in edited_images]}")
+        print(f"Mask image sizes: {[img.size for img in mask_images]}")
+        
+        # Test batch processing with multithreading
+        import time
+        start_time = time.time()
+        
+        results = compute_image_metrics_pil_batch(
+            ref_images=ref_images,
+            edited_images=edited_images, 
+            mask_images=mask_images,
+            prompts=prompts,
+            api_key=api_key,
+            max_workers=2  # Use 2 workers for this small test
+        )
+        
+        end_time = time.time()
+        processing_time = end_time - start_time
+        
+        print(f"\nProcessing completed in {processing_time:.2f} seconds")
+        print(f"Average time per image: {processing_time/len(ref_images):.2f} seconds")
+        
+        # Display results
+        for i, result in enumerate(results):
+            print(f"\n--- Results for Image Pair {i} ---")
+            if 'error' in result:
+                print(f"Error: {result['error']}")
+            else:
+                print(f"Target size: {result['target_size']}")
+                print(f"SSIM: {result.get('ssim', 'N/A'):.4f}" if result.get('ssim') is not None else "SSIM: Failed")
+                print(f"PSNR: {result.get('psnr', 'N/A'):.4f}" if result.get('psnr') is not None else "PSNR: Failed") 
+                print(f"MSE: {result.get('mse', 'N/A'):.4f}" if result.get('mse') is not None else "MSE: Failed")
+                
+                # VIEScore results
+                if 'editing_success' in result:
+                    print(f"VIE Editing Success: {result['editing_success']}")
+                    print(f"VIE Overediting Score: {result['overediting_score']}")
+                if 'naturalness' in result:
+                    print(f"VIE Naturalness: {result['naturalness']}")
+                    print(f"VIE Artifacts: {result['artifacts']}")
+                if 'vie_error' in result:
+                    print(f"VIE Error: {result['vie_error']}")
+        
+        print("\n=== Batch Processing Test Completed ===")
+        
+    except Exception as e:
+        print(f"Test failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print("\n=== Testing Single Image Processing (Legacy) ===")
+    
+    # Legacy single image test for comparison
+    try:
+        image_processor = VaeImageProcessor(vae_scale_factor=8)
+        
+        # Test the updated image_processor_flux_context function with PIL images
+        original_pil = Image.open(original_path)
+        mask_pil = Image.open(mask_path)
+        
+        original_processed = image_processor_flux_context(image_processor, original_pil, if_mask=False)
+        mask_processed = image_processor_flux_context(image_processor, mask_pil, if_mask=True)
+        
+        print(f"Original processed size: {original_processed.size}")
+        print(f"Mask processed size: {mask_processed.size}")
+        
+        print("Single image processing test completed successfully")
+        
+    except Exception as e:
+        print(f"Single image test failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     ##check if the mask is correct, show masked image
     

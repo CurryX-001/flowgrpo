@@ -403,13 +403,14 @@ def multi_score(device, score_dict):
         "geneval": geneval_score,
         "clipscore": clip_score,
         "image_similarity": image_similarity_score,
+        "image_metrics": image_metrics_score,
     }
     score_fns={}
     for score_name, weight in score_dict.items():
         score_fns[score_name] = score_functions[score_name](device) if 'device' in score_functions[score_name].__code__.co_varnames else score_functions[score_name]()
 
     # only_strict is only for geneval. During training, only the strict reward is needed, and non-strict rewards don't need to be computed, reducing reward calculation time.
-    def _fn(images, prompts, metadata, ref_images=None, only_strict=True):
+    def _fn(images, prompts, metadata, ref_images=None, mask_images=None, only_strict=True):
         total_scores = []
         score_details = {}
         
@@ -424,6 +425,35 @@ def multi_score(device, score_dict):
                     score_details[f'{key}_accuracy'] = value
             elif score_name == "image_similarity":
                 scores, rewards = score_fns[score_name](images, ref_images)
+            elif score_name == "image_metrics":
+                scores, rewards = score_fns[score_name](images, prompts, metadata, ref_images, mask_images)
+                # Extract individual metric components from rewards
+                if 'detailed_metrics' in rewards:
+                    results = rewards['detailed_metrics']
+                    ssim_scores = []
+                    tie_scores = []  # (editing_success + overediting_score) / 20
+                    pq_scores = []   # (naturalness + artifacts) / 20
+                    
+                    for result in results:
+                        if 'error' in result:
+                            ssim_scores.append(0.0)
+                            tie_scores.append(0.0)
+                            pq_scores.append(0.0)
+                            continue
+                        
+                        ssim = result.get('ssim', 0.0) if result.get('ssim') is not None else 0.0
+                        editing_success = result.get('editing_success', 0.0) if result.get('editing_success') is not None else 0.0
+                        overediting_score = result.get('overediting_score', 0.0) if result.get('overediting_score') is not None else 0.0
+                        naturalness = result.get('naturalness', 0.0) if result.get('naturalness') is not None else 0.0
+                        artifacts = result.get('artifacts', 0.0) if result.get('artifacts') is not None else 0.0
+                        
+                        ssim_scores.append(ssim)
+                        tie_scores.append((editing_success + overediting_score) / 20.0)
+                        pq_scores.append((naturalness + artifacts) / 20.0)
+                    
+                    score_details['ssim'] = ssim_scores
+                    score_details['tie_score'] = tie_scores
+                    score_details['pq_score'] = pq_scores
             else:
                 scores, rewards = score_fns[score_name](images, prompts, metadata)
             score_details[score_name] = scores
@@ -437,6 +467,83 @@ def multi_score(device, score_dict):
         score_details['avg'] = total_scores
         return score_details, {}
 
+    return _fn
+
+def image_metrics_score(device, api_key=None, max_workers=4):
+    """
+    Image quality metrics score using SSIM, PSNR, MSE and VIEScore.
+    Requires reference images and mask images for comparison.
+    """
+    from flow_grpo.new_scorer_pil_batch import compute_image_metrics_pil_batch
+    
+    def _fn(images, prompts, metadata, ref_images=None, mask_images=None):
+        """
+        Args:
+            images: Generated images (torch.Tensor or numpy.ndarray)
+            prompts: List of text prompts
+            metadata: Metadata dict (unused)
+            ref_images: List of reference PIL.Image objects for comparison
+            mask_images: List of mask PIL.Image objects for masked comparison
+        
+        Returns:
+            Combined score: ssim + (editing_success + overediting_score)/20 + (naturalness + artifacts)/20
+        """
+        if ref_images is None or mask_images is None:
+            raise ValueError("image_metrics_score requires both ref_images and mask_images")
+        
+        # Convert tensor images to PIL Images
+        if isinstance(images, torch.Tensor):
+            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
+        images_pil = [Image.fromarray(image) for image in images]
+        
+        # Ensure ref_images are PIL Images
+        if not isinstance(ref_images[0], Image.Image):
+            ref_images = [Image.fromarray(np.array(img)) if hasattr(img, '__array__') 
+                         else Image.open(img) if isinstance(img, str) 
+                         else img for img in ref_images]
+        
+        # Ensure mask_images are PIL Images  
+        if not isinstance(mask_images[0], Image.Image):
+            mask_images = [Image.fromarray(np.array(img)) if hasattr(img, '__array__')
+                          else Image.open(img) if isinstance(img, str)
+                          else img for img in mask_images]
+        
+        # Compute metrics using batch processing
+        results = compute_image_metrics_pil_batch(
+            ref_images=ref_images,
+            edited_images=images_pil,
+            mask_images=mask_images, 
+            prompts=prompts,
+            api_key=api_key,
+            max_workers=max_workers
+        )
+        
+        # Calculate combined scores using the specified formula
+        combined_scores = []
+        for result in results:
+            if 'error' in result:
+                # Default low score for failed processing
+                combined_scores.append(0.0)
+                continue
+            
+            # Start with SSIM
+            score = result.get('ssim', 0.0) if result.get('ssim') is not None else 0.0
+            
+            # Add VIEScore TIE components: (editing_success + overediting_score) / 20
+            editing_success = result.get('editing_success', 0.0) if result.get('editing_success') is not None else 0.0
+            overediting_score = result.get('overediting_score', 0.0) if result.get('overediting_score') is not None else 0.0
+            score += (editing_success + overediting_score) / 20.0
+            
+            # Add VIEScore PQ components: (naturalness + artifacts) / 20
+            naturalness = result.get('naturalness', 0.0) if result.get('naturalness') is not None else 0.0
+            artifacts = result.get('artifacts', 0.0) if result.get('artifacts') is not None else 0.0
+            score += (naturalness + artifacts) / 20.0
+            
+            combined_scores.append(score)
+        
+        return combined_scores, {'detailed_metrics': results}
+    
     return _fn
 
 def main():

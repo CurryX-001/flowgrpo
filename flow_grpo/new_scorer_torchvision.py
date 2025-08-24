@@ -8,6 +8,10 @@ import base64
 import requests
 import json
 from io import BytesIO
+import torch
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from torchmetrics.regression import MeanSquaredError
 
 PREFERRED_KONTEXT_RESOLUTIONS = [
     (672, 1568),
@@ -32,7 +36,14 @@ PREFERRED_KONTEXT_RESOLUTIONS = [
 
 class ImageMetrics:
     """A class to compute image quality metrics including SSIM, PSNR, and MSE."""
-    
+    def __init__(self, device="cuda"):
+        self.device = device
+        # background preservation
+        self.psnr_metric_calculator = PeakSignalNoiseRatio(data_range=1.0).to(device)
+        self.lpips_metric_calculator = LearnedPerceptualImagePatchSimilarity(net_type='squeeze').to(device)
+        self.mse_metric_calculator = MeanSquaredError().to(device)
+        self.ssim_metric_calculator = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+
     @staticmethod
     def load_image(image_path, target_size=(224, 224)):
         """Load and resize an image."""
@@ -71,155 +82,81 @@ class ImageMetrics:
         h, w = original.shape[:2]
         return cv2.warpAffine(edited, matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
     
-    @staticmethod
-    def calculate_ssim(image_path, edit_image_path, object_mask=None):
-        """
-        Calculate SSIM (Structural Similarity Index Measure) between two images.
-        
-        Args:
-            image_path: Path to the original image
-            edit_image_path: Path to the edited image
-            object_mask: Optional mask to exclude certain areas from calculation
-            
-        Returns:
-            SSIM score (float)
-        """
-        try:
-            image = ImageMetrics.load_image(image_path)
-            edit_image = ImageMetrics.load_image(edit_image_path)
-            
-            # Convert to grayscale
-            image = T.Grayscale()(Image.fromarray(image))
-            edit_image = T.Grayscale()(Image.fromarray(edit_image))
-            
-            # Normalize
-            image = ImageMetrics.normalize_image(image)
-            edit_image = ImageMetrics.normalize_image(edit_image)
-            
-            # Apply mask if provided
-            if object_mask is not None:
-                object_mask = np.array(object_mask)
-                # Resize mask to match image dimensions (224, 224)
-                if len(object_mask.shape) == 3:
-                    object_mask = object_mask.mean(axis=2)  # Convert to grayscale
-                mask_image = Image.fromarray((object_mask * 255).astype(np.uint8))
-                mask_resized = mask_image.resize((224, 224), Image.LANCZOS)
-                object_mask = np.array(mask_resized) / 255.0
-                object_mask = object_mask.reshape(image.shape)
-                rest_mask = np.ones(object_mask.shape, dtype=object_mask.dtype) - object_mask
-                image = image * rest_mask
-                edit_image = edit_image * rest_mask
-            
-            # Compute SSIM
-            sim, _ = ssim(image, edit_image, data_range=1.0, full=True)
-            return float(sim)
-            
-        except Exception as e:
-            print(f"Error calculating SSIM: {e}")
-            return None
-    
-    @staticmethod
-    def calculate_psnr(image_path, edit_image_path, object_mask=None):
-        """
-        Calculate PSNR (Peak Signal-to-Noise Ratio) between two images.
-        
-        Args:
-            image_path: Path to the original image
-            edit_image_path: Path to the edited image  
-            object_mask: Optional mask to exclude certain areas from calculation
-            
-        Returns:
-            PSNR score (float)
-        """
-        try:
-            original = cv2.imread(image_path)
-            edited = cv2.imread(edit_image_path)
-            
-            if original is None or edited is None:
-                return None
-            
-            # Align images
-            aligned = ImageMetrics.align_images(original, edited)
-            if aligned is None:
-                aligned = edited
-                
-            # Resize if needed
-            if aligned.shape != original.shape:
-                aligned = cv2.resize(aligned, (original.shape[1], original.shape[0]))
-            
-            # Apply mask if provided
-            if object_mask is not None:
-                mask = np.array(object_mask, dtype=np.uint8)
-                if len(mask.shape) > 2:
-                    mask = mask[:, :, 0]
-                if mask.shape != original.shape[:2]:
-                    mask = cv2.resize(mask, (original.shape[1], original.shape[0]), interpolation=cv2.INTER_NEAREST)
-                inv_mask = (mask < 128).astype(np.uint8)
-                diff = (original.astype(np.float32) - aligned.astype(np.float32)) ** 2
-                mse = np.sum(diff * inv_mask[..., None]) / (np.sum(inv_mask) * 3 + 1e-10)
-            else:
-                mse = np.mean((original.astype(np.float32) - aligned.astype(np.float32)) ** 2)
-            
-            if mse == 0:
-                return float('inf')
-            
-            psnr = 10 * np.log10((255 ** 2) / mse)
-            return float(psnr)
-            
-        except Exception as e:
-            print(f"Error calculating PSNR: {e}")
-            return None
-    
-    @staticmethod
-    def calculate_mse(image_path, edit_image_path, object_mask=None):
-        """
-        Calculate MSE (Mean Squared Error) between two images.
-        
-        Args:
-            image_path: Path to the original image
-            edit_image_path: Path to the edited image
-            object_mask: Optional mask to exclude certain areas from calculation
-            
-        Returns:
-            MSE score (float)
-        """
-        try:
-            original = cv2.imread(image_path)
-            edited = cv2.imread(edit_image_path)
-            
-            if original is None or edited is None:
-                return None
-            
-            # Align images
-            aligned = ImageMetrics.align_images(original, edited)
-            if aligned is None:
-                aligned = edited
-                
-            # Resize if needed
-            if aligned.shape != original.shape:
-                aligned = cv2.resize(aligned, (original.shape[1], original.shape[0]))
-            
-            # Apply mask if provided
-            if object_mask is not None:
-                mask = np.array(object_mask, dtype=np.uint8)
-                if len(mask.shape) > 2:
-                    mask = mask[:, :, 0]
-                if mask.shape != original.shape[:2]:
-                    mask = cv2.resize(mask, (original.shape[1], original.shape[0]), interpolation=cv2.INTER_NEAREST)
-                inv_mask = (mask < 128).astype(np.uint8)
-                diff = (original.astype(np.float32) - aligned.astype(np.float32)) ** 2
-                pixel_count = np.sum(inv_mask)
-                if pixel_count == 0:
-                    return None
-                mse = np.sum(diff * inv_mask[..., None]) / (pixel_count * 3 + 1e-10)
-            else:
-                mse = np.mean((original.astype(np.float32) - aligned.astype(np.float32)) ** 2)
-            
-            return float(mse)
-            
-        except Exception as e:
-            print(f"Error calculating MSE: {e}")
-            return None
+    # 2. PSNR
+    def calculate_psnr(self, img_pred, img_gt, mask_pred=None, mask_gt=None):
+        img_pred = np.array(img_pred).astype(np.float32) / 255
+        img_gt = np.array(img_gt).astype(np.float32) / 255
+        assert img_pred.shape == img_gt.shape, "Image shapes should be the same."
+
+        if mask_pred is not None:
+            mask_pred = np.array(mask_pred).astype(np.float32)
+            img_pred = img_pred * mask_pred
+        if mask_gt is not None:
+            mask_gt = np.array(mask_gt).astype(np.float32)
+            img_gt = img_gt * mask_gt
+
+        img_pred_tensor = torch.tensor(img_pred).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        img_gt_tensor = torch.tensor(img_gt).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        score = self.psnr_metric_calculator(img_pred_tensor, img_gt_tensor)
+        score = score.cpu().item()
+        return score
+
+    # 3. LPIPS
+    def calculate_lpips(self, img_pred, img_gt, mask_pred=None, mask_gt=None):
+        img_pred = np.array(img_pred).astype(np.float32) / 255
+        img_gt = np.array(img_gt).astype(np.float32) / 255
+        assert img_pred.shape == img_gt.shape, "Image shapes should be the same."
+
+        if mask_pred is not None:
+            mask_pred = np.array(mask_pred).astype(np.float32)
+            img_pred = img_pred * mask_pred
+        if mask_gt is not None:
+            mask_gt = np.array(mask_gt).astype(np.float32)
+            img_gt = img_gt * mask_gt
+
+        img_pred_tensor = torch.tensor(img_pred).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        img_gt_tensor = torch.tensor(img_gt).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        score = self.lpips_metric_calculator(img_pred_tensor * 2 - 1, img_gt_tensor * 2 - 1)
+        score = score.cpu().item()
+        return score
+
+    # 4. MSE
+    def calculate_mse(self, img_pred, img_gt, mask_pred=None, mask_gt=None):
+        img_pred = np.array(img_pred).astype(np.float32) / 255
+        img_gt = np.array(img_gt).astype(np.float32) / 255
+        assert img_pred.shape == img_gt.shape, "Image shapes should be the same."
+
+        if mask_pred is not None:
+            mask_pred = np.array(mask_pred).astype(np.float32)
+            img_pred = img_pred * mask_pred
+        if mask_gt is not None:
+            mask_gt = np.array(mask_gt).astype(np.float32)
+            img_gt = img_gt * mask_gt
+
+        img_pred_tensor = torch.tensor(img_pred).permute(2, 0, 1).to(self.device)
+        img_gt_tensor = torch.tensor(img_gt).permute(2, 0, 1).to(self.device)
+        score = self.mse_metric_calculator(img_pred_tensor.contiguous(), img_gt_tensor.contiguous())
+        score = score.cpu().item()
+        return score
+
+    # 5. SSIM
+    def calculate_ssim(self, img_pred, img_gt, mask_pred=None, mask_gt=None):
+        img_pred = np.array(img_pred).astype(np.float32) / 255
+        img_gt = np.array(img_gt).astype(np.float32) / 255
+        assert img_pred.shape == img_gt.shape, "Image shapes should be the same."
+
+        if mask_pred is not None:
+            mask_pred = np.array(mask_pred).astype(np.float32)
+            img_pred = img_pred * mask_pred
+        if mask_gt is not None:
+            mask_gt = np.array(mask_gt).astype(np.float32)
+            img_gt = img_gt * mask_gt
+
+        img_pred_tensor = torch.tensor(img_pred).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        img_gt_tensor = torch.tensor(img_gt).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        score = self.ssim_metric_calculator(img_pred_tensor, img_gt_tensor)
+        score = score.cpu().item()
+        return score
 
 
 class VIEScore:
@@ -414,7 +351,7 @@ Put the score in a list such that output score = [naturalness, artifacts]"""
         }
 
 
-def compute_image_metrics(original_path, edited_path, object_mask=None, vie_instruction=None, api_key=None):
+def compute_image_metrics(original_path, edited_path, mask_path, vie_instruction=None, api_key=None):
     """
     Compute all image metrics (SSIM, PSNR, MSE, VIEScore) for a pair of images.
     
@@ -428,25 +365,34 @@ def compute_image_metrics(original_path, edited_path, object_mask=None, vie_inst
     Returns:
         Dictionary containing all computed metrics
     """
-    if not os.path.exists(original_path) or not os.path.exists(edited_path):
-        return None
+    image_processor = VaeImageProcessor(vae_scale_factor=8)
+    ImageMetrics_instance = ImageMetrics(device="cpu")
+
+    original_image = image_processor_flux_context(image_processor, original_path, if_mask=False)
+    edited_image = image_processor_flux_context(image_processor, edited_path, if_mask=False).resize((original_image.size[0], original_image.size[1]), resample=Image.BICUBIC)
+    mask_image = image_processor_flux_context(image_processor, mask_path, if_mask=True)
+
+    assert original_image.size == edited_image.size, "Image shapes should be the same."
+    assert original_image.size == mask_image.size, "Image shapes should be the same."
+
+    # process mask
+    mask_image = np.asarray(mask_image, dtype=np.int64) / 255
+    mask_image = 1 - mask_image
+    mask_image = mask_image[:, :, np.newaxis].repeat([3], axis=2)
         
     metrics = {
-        'mse': ImageMetrics.calculate_mse(original_path, edited_path, object_mask),
-        'psnr': ImageMetrics.calculate_psnr(original_path, edited_path, object_mask), 
-        'ssim': ImageMetrics.calculate_ssim(original_path, edited_path, object_mask),
+        'ssim': ImageMetrics_instance.calculate_ssim(original_image, edited_image, mask_image),
+        'psnr': ImageMetrics_instance.calculate_psnr(original_image, edited_image, mask_image), 
+        'mse': ImageMetrics_instance.calculate_mse(original_image, edited_image, mask_image)
     }
     
     # Add VIEScore evaluation if instruction is provided
     if vie_instruction and (api_key or os.environ.get('OPENAI_API_KEY')):
         try:
             vie_scorer = VIEScore(api_key=api_key)
-            vie_tie_results = vie_scorer.evaluate_tie(original_path, edited_path, vie_instruction)
-            vie_pq_results = vie_scorer.evaluate_pq(edited_path)
-            if vie_tie_results:
-                metrics.update(vie_tie_results)
-            if vie_pq_results:
-                metrics.update(vie_pq_results)
+            vie_results = vie_scorer.evaluate_tie(original_path, edited_path, vie_instruction)
+            if vie_results:
+                metrics.update(vie_results)
         except Exception as e:
             print(f"VIEScore evaluation failed: {e}")
             metrics['vie_error'] = str(e)
@@ -509,27 +455,14 @@ def image_processor_flux_context(image_processor, image_path, _auto_resize=True,
 if __name__ == "__main__":
     from diffusers.image_processor import VaeImageProcessor
     image_processor = VaeImageProcessor(vae_scale_factor=8)
-    api_key = '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'
 
     original_path = "/Users/ljq/Downloads/020.png"
-    edited_path = "/Users/ljq/Downloads/generation-85c8e002-5378-4dc9-9ee8-d4e3dd8a2db1.png"
-    edited_ovis_path = "/Users/ljq/Downloads/image_ovis.webp"
+    edited_path = "/Users/ljq/Downloads/image_ovis.webp"
     mask_path = "/Users/ljq/Downloads/020_mask.jpg"
 
-    original_image = image_processor_flux_context(image_processor, original_path, if_mask=False)
-    mask_image = image_processor_flux_context(image_processor, mask_path, if_mask=True).resize((original_image.size[0], original_image.size[1]), resample=Image.BICUBIC)
-
-    print(original_image.size)
-    print(mask_image.size)
-
-    mask_image = np.asarray(mask_image, dtype=np.int64) / 255
-    mask_image = mask_image[:, :, np.newaxis].repeat([3], axis=2)
-
-    result = compute_image_metrics(original_path, edited_path, mask_image, vie_instruction="Change the middle bird to a chicken", api_key=api_key)
-    result_ovis = compute_image_metrics(original_path, edited_ovis_path, mask_image, vie_instruction="Change the middle bird to a chicken", api_key=api_key)
+    result = compute_image_metrics(original_path, edited_path, mask_path)
 
     print(result)
-    print(result_ovis)
 
     ##check if the mask is correct, show masked image
     
@@ -581,7 +514,7 @@ if __name__ == "__main__":
         
         return concatenated
     
-    # # Create and show the visualization
-    # viz_image = create_mask_visualization(original_image, mask_image)
-    # viz_image.show()
+    # Create and show the visualization
+    viz_image = create_mask_visualization(original_image, mask_image)
+    viz_image.show()
     
